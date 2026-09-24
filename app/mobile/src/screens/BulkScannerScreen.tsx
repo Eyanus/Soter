@@ -14,7 +14,7 @@ import { RootStackParamList } from '../navigation/types';
 import { useTheme } from '../theme/ThemeContext';
 import { useTranslation } from '../i18n/useTranslation';
 import { useSync } from '../contexts/SyncContext';
-import { createScanDeduper } from './scanDeduper';
+import { createBulkScanDeduper, BulkScanDuplicateStatus } from './scanDeduper';
 import { useCameraPermission } from '../hooks/useCameraPermission';
 import { CameraPermissionDenied } from '../components/CameraPermissionDenied';
 
@@ -45,8 +45,8 @@ export const BulkScannerScreen: React.FC<Props> = ({ navigation }) => {
 
   const { colors } = useTheme();
   const { t } = useTranslation();
-  const { queueClaimConfirmation, isConnected } = useSync();
-  const [isDuplicateScan] = useState(() => createScanDeduper());
+  const { queueClaimConfirmation } = useSync();
+  const [scanDeduper] = useState(() => createBulkScanDeduper());
 
   const {
     permissionState,
@@ -63,11 +63,20 @@ export const BulkScannerScreen: React.FC<Props> = ({ navigation }) => {
     if (isProcessing) return;
 
     const normalizedData = data.trim();
-    if (isDuplicateScan(normalizedData)) {
-      setStats(prev => ({ ...prev, skipped: prev.skipped + 1 }));
-      setLastScanResult({ status: 'skipped', message: 'Duplicate scan skipped. Ready for the next package.' });
-      return;
-    }
+    const duplicateStatus: BulkScanDuplicateStatus =
+  await scanDeduper.check(normalizedData);
+
+if (duplicateStatus !== 'new') {
+  setStats(prev => ({ ...prev, skipped: prev.skipped + 1 }));
+  setLastScanResult({
+    status: 'skipped',
+    message:
+      duplicateStatus === 'same-session-duplicate'
+        ? 'Duplicate scan skipped. Already scanned in this session.'
+        : 'Duplicate scan skipped. This package was scanned in an earlier session.',
+  });
+  return;
+}
 
     setIsProcessing(true);
 
