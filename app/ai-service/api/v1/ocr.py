@@ -525,12 +525,15 @@ def _refresh_document(batch_id: str, document: OCRBatchDocument) -> None:
                 "message": str(info.get("error") or "OCR job failed"),
             },
         )
-    elif task_state in ("cancelled", "expired"):
+    elif task_state in ("cancelled", "expired", "timed_out"):
         ocr_batch_store.update_document(
             batch_id,
             document.document_id,
             status="failed",
-            error={"code": f"job_{task_state}", "message": f"OCR job {task_state}"},
+            error={
+                "code": f"job_{task_state}",
+                "message": f"OCR job {task_state.replace('_', ' ')}",
+            },
         )
     elif task_state in ("processing", "retrying"):
         ocr_batch_store.update_document(

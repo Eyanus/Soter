@@ -65,6 +65,7 @@ class Settings(BaseSettings):
         HOST: Server host (default: 0.0.0.0)
         PORT: Server port (default: 8000)
         REDIS_URL: Redis connection URL for task broker (default: redis://localhost:6379/0)
+        ASYNC_JOB_IDLE_TIMEOUT_SECONDS: Queued jobs not started by a worker within this window are marked timed out (default: 600)
         BACKEND_WEBHOOK_URL: Webhook URL to notify NestJS backend when tasks complete
         PROOF_OF_LIFE_CONFIDENCE_THRESHOLD: Default threshold for liveness verification
         PROOF_OF_LIFE_MIN_FACE_SIZE: Minimum detected face size in pixels
@@ -204,6 +205,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     task_max_retries: int = 3
     task_retry_delay_seconds: int = 30
+    # A job still waiting for a worker after this many seconds is marked
+    # timed_out on its next status poll instead of sitting queued forever
+    # (issue #1208). Only applies to jobs that have not started processing.
+    async_job_idle_timeout_seconds: float = 600.0
 
     # Backend webhook URL for notifications
     backend_webhook_url: HttpUrl = (
@@ -348,6 +353,7 @@ class Settings(BaseSettings):
             ("CACHE_TTL_ARTIFACT_ACCESS", self.cache_ttl_artifact_access),
             ("CACHE_TTL_VERIFICATION", self.cache_ttl_verification),
             ("TASK_RETRY_DELAY_SECONDS", self.task_retry_delay_seconds),
+            ("ASYNC_JOB_IDLE_TIMEOUT_SECONDS", self.async_job_idle_timeout_seconds),
             (
                 "VERIFICATION_ARTIFACT_URL_TTL_SECONDS",
                 self.verification_artifact_url_ttl_seconds,
