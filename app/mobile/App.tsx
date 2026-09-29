@@ -30,11 +30,10 @@ import {
 } from './src/contexts/CrashReportingContext';
 import { ReleaseNotesModal } from './src/components/ReleaseNotesModal';
 import { ForceUpgradeScreen } from './src/screens/ForceUpgradeScreen';
+import { WalletReconnectE2EScreen } from './src/e2e/WalletReconnectE2EScreen';
 import { markColdStartPhase } from './src/startup/coldStartTracker';
 
-// ---------------------------------------------------------------------------
-// Deep-link configuration for React Navigation
-// ---------------------------------------------------------------------------
+const isWalletReconnectE2E = process.env.EXPO_PUBLIC_E2E_WALLET_RECONNECT === '1';
 
 const linking = {
   prefixes: [ExpoLinking.createURL('/'), 'soter://'],
@@ -52,10 +51,6 @@ const linking = {
   },
 };
 
-// ---------------------------------------------------------------------------
-// Inner component – lives inside all providers so it can access contexts
-// ---------------------------------------------------------------------------
-
 const AppInner = () => {
   const { navTheme, scheme } = useTheme();
   const { pendingDeepLink, consumeDeepLink } = useNotification();
@@ -64,9 +59,6 @@ const AppInner = () => {
   const { isForceUpgrade, isLoading } = useUpdate();
   const [isNavReady, setIsNavReady] = useState(false);
 
-  // -----------------------------------------------------------------------
-  // Navigate when a deep link is pending (from notification tap)
-  // -----------------------------------------------------------------------
   useEffect(() => {
     if (!pendingDeepLink || !isNavReady) return;
 
@@ -95,48 +87,40 @@ const AppInner = () => {
 
   return (
     <WalletProvider>
-      <BiometricProvider>
-        <SyncDeferralProvider>
-          <SyncProvider>
-            <NavigationContainer
-              linking={linking}
-              theme={navTheme}
-              ref={navigationRef}
-              onReady={() => {
-                markColdStartPhase('navigationReady');
-                setIsNavReady(true);
-              }}
-            >
-              <AppNavigator />
-              <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
-            </NavigationContainer>
-            <ReleaseNotesModal />
-          </SyncProvider>
-        </SyncDeferralProvider>
-      </BiometricProvider>
+      {isWalletReconnectE2E ? (
+        <WalletReconnectE2EScreen />
+      ) : (
+        <BiometricProvider>
+          <SyncDeferralProvider>
+            <SyncProvider>
+              <NavigationContainer
+                linking={linking}
+                theme={navTheme}
+                ref={navigationRef}
+                onReady={() => {
+                  markColdStartPhase('navigationReady');
+                  setIsNavReady(true);
+                }}
+              >
+                <AppNavigator />
+                <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
+              </NavigationContainer>
+              <ReleaseNotesModal />
+            </SyncProvider>
+          </SyncDeferralProvider>
+        </BiometricProvider>
+      )}
     </WalletProvider>
   );
 };
 
-// ---------------------------------------------------------------------------
-// Root – wraps providers from the outside in
-// ---------------------------------------------------------------------------
-
-/**
- * Wrapper that reads the crash-reporting preference and renders the Sentry
- * ErrorBoundary around the rest of the app.
- */
 const CrashReportingGate: React.FC = () => {
   const { isLoading } = useCrashReporting();
-  // While the preference is loading, render nothing to avoid a flash of the
-  // wrong state. The CrashReportingProvider already handles init.
   if (isLoading) return null;
 
   return (
     <ErrorBoundary
       onError={(error, errorInfo) => {
-        // The ErrorBoundary already reports to Sentry automatically.
-        // We just log for development diagnostics.
         console.warn('[CrashReportingGate] Caught by ErrorBoundary:', error);
       }}
     >
