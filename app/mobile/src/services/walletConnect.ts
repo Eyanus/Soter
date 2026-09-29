@@ -3,7 +3,6 @@ import SignClient from '@walletconnect/sign-client';
 
 import { config, getStellarChainId } from '../config';
 import {
-  secureRead,
   secureWrite,
   secureDelete,
   SECURE_KEY_WC_SESSION,
@@ -14,6 +13,7 @@ const APP_SCHEME = 'soter';
 const DEFAULT_APP_URL = 'https://github.com/Pulsefy/Soter';
 const DEFAULT_ICON = 'https://raw.githubusercontent.com/Pulsefy/Soter/main/app/mobile/assets/icon.png';
 const STELLAR_NAMESPACE = 'stellar';
+const E2E_MODE = process.env.EXPO_PUBLIC_E2E_WALLET_RECONNECT === '1';
 
 const STELLAR_METHODS = ['stellar_signXDR', 'stellar_signAndSubmitXDR'];
 const STELLAR_EVENTS = ['accountsChanged', 'chainChanged'];
@@ -53,7 +53,10 @@ type SessionShape = {
   topic: string;
 };
 
+export type WalletSessionExpiryListener = (topic: string) => void;
+
 let signClientPromise: Promise<SignClient> | null = null;
+const e2eExpiryListeners = new Map<string, Set<WalletSessionExpiryListener>>();
 
 const getWalletConnectProjectId = () => {
   return config.walletConnectProjectId;
@@ -145,6 +148,44 @@ const getSignClient = async () => {
   return signClientPromise;
 };
 
+/** Subscribe to WalletConnect session expiry/deletion for the active topic. */
+export const subscribeWalletSessionExpiry = async (
+  topic: string,
+  listener: WalletSessionExpiryListener,
+) => {
+  if (E2E_MODE) {
+    const listeners = e2eExpiryListeners.get(topic) ?? new Set<WalletSessionExpiryListener>();
+    listeners.add(listener);
+    e2eExpiryListeners.set(topic, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) e2eExpiryListeners.delete(topic);
+    };
+  }
+
+  const client = await getSignClient();
+  const onDelete = ({ topic: deletedTopic }: { topic: string }) => {
+    if (deletedTopic === topic) listener(deletedTopic);
+  };
+  const onExpire = ({ topic: expiredTopic }: { topic: string }) => {
+    if (expiredTopic === topic) listener(expiredTopic);
+  };
+
+  client.on('session_delete', onDelete);
+  client.on('session_expire', onExpire);
+
+  return () => {
+    client.off('session_delete', onDelete);
+    client.off('session_expire', onExpire);
+  };
+};
+
+/** Test-only event injection using the same listener path as real expiry events. */
+export const triggerWalletSessionExpiryForE2E = (topic: string) => {
+  if (!E2E_MODE) return;
+  e2eExpiryListeners.get(topic)?.forEach((listener) => listener(topic));
+};
+
 export const buildSep7TransactionUri = ({
   xdr,
   callback,
@@ -191,6 +232,8 @@ export const openSep7TransactionRequest = async (request: Sep7TransactionRequest
 };
 
 export const openWalletConnectPairingUri = async (pairingUri: string) => {
+  if (E2E_MODE) return;
+
   const canOpen = await ExpoLinking.canOpenURL(pairingUri);
   if (!canOpen) {
     throw new Error(
@@ -202,6 +245,19 @@ export const openWalletConnectPairingUri = async (pairingUri: string) => {
 };
 
 export const createWalletConnection = async () => {
+  if (E2E_MODE) {
+    return {
+      pairingUri: 'soter://e2e/wallet-approval',
+      approval: async (): Promise<ConnectedWalletSession> => ({
+        topic: `e2e-wallet-session-${Date.now()}`,
+        publicKey: 'GTESTWALLETRECONNECT000000000000000000000000000000000000000000',
+        accounts: [`stellar:${getWalletConnectChainId()}:GTESTWALLETRECONNECT000000000000000000000000000000000000000000`],
+        walletName: 'E2E Test Wallet',
+        chainIds: [getWalletConnectChainId()],
+      }),
+    };
+  }
+
   const client = await getSignClient();
   const { uri, approval } = await client.connect({
     requiredNamespaces: {
@@ -221,20 +277,19 @@ export const createWalletConnection = async () => {
     pairingUri: uri,
     approval: async () => {
       const session = toConnectedWalletSession(await approval());
-
-      // Persist the approved session topic to secure storage.
       try {
         await secureWrite(SECURE_KEY_WC_SESSION, session.topic);
       } catch {
         // Non-fatal: WalletConnect's own relay store is the source of truth.
       }
-
       return session;
     },
   };
 };
 
 export const restoreWalletSession = async () => {
+  if (E2E_MODE) return null;
+
   if (!getWalletConnectProjectId()) {
     return null;
   }
@@ -248,10 +303,6 @@ export const restoreWalletSession = async () => {
 
     const session = sessions[0] as SessionShape;
     const restored = toConnectedWalletSession(session);
-
-    // Persist the active topic to secure storage so it survives a cold start
-    // even before the WalletConnect relay can confirm the session.
-    // This is a best-effort write — a failure here should not block the restore.
     try {
       await secureWrite(SECURE_KEY_WC_SESSION, restored.topic);
     } catch {
@@ -260,7 +311,6 @@ export const restoreWalletSession = async () => {
 
     return restored;
   } catch (error) {
-    // Re-throw SecureStorageUnavailableError so WalletContext can detect it.
     if (error instanceof SecureStorageUnavailableError) {
       throw error;
     }
@@ -269,6 +319,8 @@ export const restoreWalletSession = async () => {
 };
 
 export const disconnectWalletSession = async (topic: string) => {
+  if (E2E_MODE) return;
+
   const client = await getSignClient();
   await client.disconnect({
     topic,
@@ -278,7 +330,6 @@ export const disconnectWalletSession = async (topic: string) => {
     },
   });
 
-  // Remove the session topic from secure storage so no stale reference remains.
   await secureDelete(SECURE_KEY_WC_SESSION);
 };
 
