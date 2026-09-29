@@ -1,0 +1,22 @@
+appId: org.pulsefy.soter.mobile
+---
+- launchApp:
+    clearState: true
+- tapOn:
+    id: "e2e-connect-wallet"
+- assertVisible:
+    text: "Wallet status: connected"
+- tapOn:
+    id: "e2e-start-pending-action"
+- tapOn:
+    id: "e2e-expire-session"
+- assertVisible:
+    id: "wallet-reconnect-prompt"
+- tapOn:
+    id: "e2e-cancel-reconnect"
+- assertVisible:
+    id: "e2e-reconnect-cancelled"
+- assertNotVisible:
+    id: "wallet-reconnect-prompt"
+- assertNotVisible:
+    id: "e2e-pending-action-resumed"
