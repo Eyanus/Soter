@@ -70,7 +70,13 @@ jobs:
       - name: Install Maestro CLI
         run: |
           curl -FsSL "https://get.maestro.mobile.dev" | bash
-          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          MAESTRO_BIN="$HOME/.maestro/bin/maestro"
+          if [ ! -x "$MAESTRO_BIN" ]; then
+            echo "Maestro installation failed: $MAESTRO_BIN was not created"
+            exit 1
+          fi
+          "$MAESTRO_BIN" --version
+          echo "MAESTRO_BIN=$MAESTRO_BIN" >> "$GITHUB_ENV"
 
       - name: Run wallet reconnect E2E scenarios
         uses: reactivecircus/android-emulator-runner@v2
@@ -87,10 +93,9 @@ jobs:
             adb install -r android/app/build/outputs/apk/release/app-release.apk
 
             set +e
-            export PATH="$HOME/.maestro/bin:$PATH"
-            maestro test --debug-output .maestro/debug .maestro/wallet-reconnect-success.yaml
+            "$MAESTRO_BIN" test --debug-output .maestro/debug .maestro/wallet-reconnect-success.yaml
             SUCCESS_EXIT=$?
-            maestro test --debug-output .maestro/debug .maestro/wallet-reconnect-cancel.yaml
+            "$MAESTRO_BIN" test --debug-output .maestro/debug .maestro/wallet-reconnect-cancel.yaml
             CANCEL_EXIT=$?
 
             adb logcat -d > .maestro/debug/logcat.txt
