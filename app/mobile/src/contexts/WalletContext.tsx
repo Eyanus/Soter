@@ -7,40 +7,20 @@ import {
   disconnectWalletSession,
   openWalletConnectPairingUri,
   restoreWalletSession,
+  subscribeWalletSessionExpiry,
+  triggerWalletSessionExpiryForE2E,
 } from '../services/walletConnect';
 import { confirmValueMovingAction } from '../services/valueActionConfirmation';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { detectWalletNetwork, WalletNetworkInfo } from '../services/networkGuard';
-import {
-  migrateFromAsyncStorage,
-  secureClearAll,
-} from '../services/secureStorage';
+import { migrateFromAsyncStorage, secureClearAll } from '../services/secureStorage';
 
-/**
- * Lifecycle state of the session-restore bootstrap.
- *
- * - 'restoring'           The provider is currently calling restoreWalletSession on mount.
- * - 'restored'            A persisted session was found and rehydrated successfully.
- * - 'none'                Bootstrap completed but no stored session was found.
- * - 'failed'              Bootstrap threw an error; the session could not be restored.
- * - 'secure_unavailable'  The platform Keychain / Keystore was inaccessible during
- *                         restore. The user must re-authenticate to unlock the secure
- *                         enclave before a session can be recovered.
- */
 export type RestoreStatus = 'restoring' | 'restored' | 'none' | 'failed' | 'secure_unavailable';
 
 interface WalletContextValue {
   connectWallet: () => Promise<void>;
   disconnectWallet: () => Promise<void>;
-  /**
-   * Clears a 'failed' restore or connect error and resets the wallet to idle,
-   * allowing the user to attempt a fresh connection.
-   */
   recoverSession: () => void;
-  /**
-   * Triggers a re-authentication flow when secure storage is unavailable.
-   * On success the bootstrap is retried. On failure the wallet stays locked.
-   */
   reauthenticate: () => Promise<void>;
   error: string | null;
   lastDeepLinkUrl: string | null;
@@ -48,37 +28,36 @@ interface WalletContextValue {
   publicKey: string | null;
   reopenWallet: () => Promise<void>;
   status: WalletConnectionStatus;
-  /** Lifecycle state of the on-mount session-restore bootstrap. */
   restoreStatus: RestoreStatus;
-  /**
-   * True when secure storage is unavailable and the user must unlock the
-   * device before session material can be accessed.
-   */
   secureStorageUnavailable: boolean;
   walletName: string | null;
-  // Network-related properties
   chainIds: string[];
   walletNetworkInfo: WalletNetworkInfo | null;
   isOnCorrectNetwork: boolean;
   checkNetwork: () => void;
+  /** True after WalletConnect reports that the active session expired or was deleted. */
+  sessionExpired: boolean;
+  /** Clears the reconnect prompt without reconnecting. */
+  cancelReconnect: () => void;
+  /** Test-only expiry trigger used by the Maestro harness. */
+  expireSessionForE2E: () => void;
 }
 
 const WalletContext = createContext<WalletContextValue | undefined>(undefined);
 
 const getErrorMessage = (error: unknown) => {
-  if (error instanceof Error) {
-    return error.message;
-  }
+  if (error instanceof Error) return error.message;
   return 'An unexpected wallet error occurred.';
 };
 
 const idleState = {
   error: null,
-  pairingUri: null,
   publicKey: null,
   status: 'idle' as WalletConnectionStatus,
   walletName: null,
 };
+
+const E2E_MODE = process.env.EXPO_PUBLIC_E2E_WALLET_RECONNECT === '1';
 
 export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
   const [status, setStatus] = useState<WalletConnectionStatus>('idle');
@@ -90,38 +69,49 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
   const [pairingUri, setPairingUri] = useState<string | null>(null);
   const [lastDeepLinkUrl, setLastDeepLinkUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sessionExpired, setSessionExpired] = useState(false);
 
-  // Network state
   const [chainIds, setChainIds] = useState<string[]>([]);
   const [walletNetworkInfo, setWalletNetworkInfo] = useState<WalletNetworkInfo | null>(null);
   const [isOnCorrectNetwork, setIsOnCorrectNetwork] = useState<boolean>(false);
-
   const networkStatus = useNetworkStatus();
+
+  const applyConnectedSession = (session: ConnectedWalletSession) => {
+    setTopic(session.topic);
+    setPublicKey(session.publicKey);
+    setWalletName(session.walletName);
+    setPairingUri(null);
+    setError(null);
+    setStatus('connected');
+    setSessionExpired(false);
+    setSecureStorageUnavailable(false);
+
+    const sessionChainIds = session.chainIds ?? [];
+    setChainIds(sessionChainIds);
+    const networkInfo = detectWalletNetwork(sessionChainIds);
+    setWalletNetworkInfo(networkInfo);
+    setIsOnCorrectNetwork(networkInfo.isKnown && networkInfo.isTestnet);
+  };
+
+  const handleSessionExpired = (expiredTopic: string) => {
+    if (!topic || expiredTopic !== topic) return;
+
+    setTopic(null);
+    setPublicKey(null);
+    setWalletName(null);
+    setPairingUri(null);
+    setChainIds([]);
+    setWalletNetworkInfo(null);
+    setIsOnCorrectNetwork(false);
+    setStatus('error');
+    setError('Your wallet session expired. Reconnect your wallet to continue the pending action.');
+    setSessionExpired(true);
+  };
 
   useEffect(() => {
     let isMounted = true;
 
-    const applyConnectedSession = (session: ConnectedWalletSession) => {
-      if (!isMounted) return;
-
-      setTopic(session.topic);
-      setPublicKey(session.publicKey);
-      setWalletName(session.walletName);
-      setPairingUri(null);
-      setError(null);
-      setStatus('connected');
-
-      const sessionChainIds = session.chainIds ?? [];
-      setChainIds(sessionChainIds);
-
-      const networkInfo = detectWalletNetwork(sessionChainIds);
-      setWalletNetworkInfo(networkInfo);
-      setIsOnCorrectNetwork(networkInfo.isKnown && networkInfo.isTestnet);
-    };
-
     const bootstrap = async () => {
-      // Run one-shot migration from AsyncStorage → secure storage before any
-      // session restore attempt.  This is a no-op on subsequent launches.
       try {
         await migrateFromAsyncStorage();
       } catch {
@@ -143,10 +133,6 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
       } catch (sessionError) {
         if (!isMounted) return;
 
-        // Detect whether the error originated from a secure storage failure.
-        // Any error whose message contains "secure" or "keychain/keystore"
-        // keywords, or the SecureStorageUnavailableError type, is treated as a
-        // hardware-level lockout that requires the user to re-authenticate.
         const msg = sessionError instanceof Error ? sessionError.message : '';
         const isSecureFailure =
           sessionError?.constructor?.name === 'SecureStorageUnavailableError' ||
@@ -156,9 +142,7 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
           setSecureStorageUnavailable(true);
           setRestoreStatus('secure_unavailable');
           setStatus('error');
-          setError(
-            'Wallet credentials are locked. Please unlock your device and try again.',
-          );
+          setError('Wallet credentials are locked. Please unlock your device and try again.');
         } else {
           setError(getErrorMessage(sessionError));
           setStatus('error');
@@ -169,17 +153,13 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
 
     const captureInitialUrl = async () => {
       const url = await ExpoLinking.getInitialURL();
-      if (url && isMounted) {
-        setLastDeepLinkUrl(url);
-      }
+      if (url && isMounted) setLastDeepLinkUrl(url);
     };
 
     void bootstrap();
     void captureInitialUrl();
 
-    const subscription = ExpoLinking.addEventListener('url', ({ url }) => {
-      setLastDeepLinkUrl(url);
-    });
+    const subscription = ExpoLinking.addEventListener('url', ({ url }) => setLastDeepLinkUrl(url));
 
     return () => {
       isMounted = false;
@@ -187,7 +167,17 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
     };
   }, []);
 
-  // Re-validate network when chainIds or connectivity changes
+  useEffect(() => {
+    if (!topic) return;
+
+    let cleanup: (() => void) | undefined;
+    void subscribeWalletSessionExpiry(topic, handleSessionExpired).then((unsubscribe) => {
+      cleanup = unsubscribe;
+    });
+
+    return () => cleanup?.();
+  }, [topic]);
+
   useEffect(() => {
     if (status === 'connected' && chainIds.length > 0) {
       const networkInfo = detectWalletNetwork(chainIds);
@@ -207,6 +197,7 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
     setWalletNetworkInfo(null);
     setIsOnCorrectNetwork(false);
     setSecureStorageUnavailable(false);
+    setSessionExpired(false);
   };
 
   const connectWallet = async () => {
@@ -226,19 +217,7 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
 
       try {
         const session = await approval();
-        setTopic(session.topic);
-        setPublicKey(session.publicKey);
-        setWalletName(session.walletName);
-        setPairingUri(null);
-        setError(null);
-        setStatus('connected');
-
-        const sessionChainIds = session.chainIds ?? [];
-        setChainIds(sessionChainIds);
-
-        const networkInfo = detectWalletNetwork(sessionChainIds);
-        setWalletNetworkInfo(networkInfo);
-        setIsOnCorrectNetwork(networkInfo.isKnown && networkInfo.isTestnet);
+        applyConnectedSession(session);
       } catch (approvalError) {
         setError(getErrorMessage(approvalError));
         setStatus('error');
@@ -251,20 +230,15 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
 
   const disconnectWallet = async () => {
     const activeTopic = topic;
-
     const confirmationResult = await confirmValueMovingAction('Confirm wallet disconnect');
     if (!confirmationResult.ok) {
-      if (confirmationResult.reason === 'cancelled') {
-        return;
-      }
+      if (confirmationResult.reason === 'cancelled') return;
       setError('Biometric confirmation failed. Please try again.');
       return;
     }
 
     resetWalletState();
 
-    // Purge all wallet session material from secure storage on explicit
-    // disconnect so a future re-pair starts from a clean state.
     try {
       await secureClearAll();
     } catch {
@@ -281,38 +255,15 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
     }
   };
 
-  /**
-   * Clears any restore or connection error and returns the wallet to idle.
-   * Intended to be called from the WalletSessionBanner "Try Again" CTA or
-   * from the NetworkGuardBanner "Reconnect Wallet" CTA.
-   */
   const recoverSession = () => {
     resetWalletState();
-    // Allow a subsequent successful restore to update restoreStatus again
     setRestoreStatus('none');
   };
 
-  /**
-   * Re-authentication flow for when secure storage is unavailable.
-   *
-   * Prompts the user for biometric / passcode confirmation then retries the
-   * session restore.  If the re-authentication succeeds the wallet provider
-   * boots as if the device had just been unlocked.  If it fails (user
-   * cancels or hardware error) the wallet stays in 'secure_unavailable'.
-   */
   const reauthenticate = async () => {
-    // Ask the user to authenticate via biometric / device passcode.
-    const confirmationResult = await confirmValueMovingAction(
-      'Unlock your wallet to continue',
-    );
+    const confirmationResult = await confirmValueMovingAction('Unlock your wallet to continue');
+    if (!confirmationResult.ok) return;
 
-    if (!confirmationResult.ok) {
-      // User cancelled — keep the secure_unavailable state so the banner
-      // remains visible without overwriting the current error message.
-      return;
-    }
-
-    // Authentication succeeded — retry the session restore.
     setRestoreStatus('restoring');
     setError(null);
     setSecureStorageUnavailable(false);
@@ -321,19 +272,7 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
     try {
       const existingSession = await restoreWalletSession();
       if (existingSession) {
-        setTopic(existingSession.topic);
-        setPublicKey(existingSession.publicKey);
-        setWalletName(existingSession.walletName);
-        setPairingUri(null);
-        setError(null);
-        setStatus('connected');
-
-        const sessionChainIds = existingSession.chainIds ?? [];
-        setChainIds(sessionChainIds);
-
-        const networkInfo = detectWalletNetwork(sessionChainIds);
-        setWalletNetworkInfo(networkInfo);
-        setIsOnCorrectNetwork(networkInfo.isKnown && networkInfo.isTestnet);
+        applyConnectedSession(existingSession);
         setRestoreStatus('restored');
       } else {
         setRestoreStatus('none');
@@ -343,6 +282,17 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
       setStatus('error');
       setRestoreStatus('failed');
     }
+  };
+
+  const cancelReconnect = () => {
+    setSessionExpired(false);
+    setError(null);
+    setStatus('idle');
+  };
+
+  const expireSessionForE2E = () => {
+    if (!E2E_MODE || !topic) return;
+    triggerWalletSessionExpiryForE2E(topic);
   };
 
   const reopenWallet = async () => {
@@ -385,6 +335,9 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
         walletNetworkInfo,
         isOnCorrectNetwork,
         checkNetwork,
+        sessionExpired,
+        cancelReconnect,
+        expireSessionForE2E,
       }}
     >
       {children}
@@ -394,8 +347,6 @@ export const WalletProvider: React.FC<PropsWithChildren> = ({ children }) => {
 
 export const useWallet = () => {
   const context = useContext(WalletContext);
-  if (!context) {
-    throw new Error('useWallet must be used within a WalletProvider.');
-  }
+  if (!context) throw new Error('useWallet must be used within a WalletProvider.');
   return context;
 };
