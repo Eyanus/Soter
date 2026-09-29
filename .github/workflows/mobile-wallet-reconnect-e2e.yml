@@ -1,0 +1,110 @@
+name: Mobile Wallet Reconnect E2E
+
+# Issue #1158: verify session expiry mid-use, reconnect/resume, and
+# user-cancelled reconnect. The fixture is enabled only in this workflow.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app/mobile/**'
+      - '.github/workflows/mobile-wallet-reconnect-e2e.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'app/mobile/**'
+      - '.github/workflows/mobile-wallet-reconnect-e2e.yml'
+  workflow_dispatch: {}
+
+jobs:
+  wallet-reconnect-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EXPO_PUBLIC_E2E_WALLET_RECONNECT: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Generate native Android project
+        working-directory: app/mobile
+        run: CI=1 npx expo prebuild --platform android
+        env:
+          CI: '1'
+          EXPO_PUBLIC_E2E_WALLET_RECONNECT: '1'
+
+      - name: Build release APK
+        working-directory: app/mobile/android
+        run: ./gradlew assembleRelease --no-daemon
+        env:
+          EXPO_PUBLIC_E2E_WALLET_RECONNECT: '1'
+          SENTRY_DISABLE_AUTO_UPLOAD: 'true'
+          SENTRY_DISABLE_NATIVE_DEBUG_UPLOAD: 'true'
+
+      - name: Install Maestro CLI
+        run: |
+          curl -FsSL "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Run wallet reconnect E2E scenarios
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          target: default
+          arch: x86_64
+          profile: Nexus 6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -memory 2048 -cores 2
+          disable-animations: true
+          working-directory: app/mobile
+          script: |
+            mkdir -p .maestro/debug
+            adb install -r android/app/build/outputs/apk/release/app-release.apk
+
+            set +e
+            export PATH="$HOME/.maestro/bin:$PATH"
+            maestro test --debug-output .maestro/debug .maestro/wallet-reconnect-success.yaml
+            SUCCESS_EXIT=$?
+            maestro test --debug-output .maestro/debug .maestro/wallet-reconnect-cancel.yaml
+            CANCEL_EXIT=$?
+
+            adb logcat -d > .maestro/debug/logcat.txt
+            adb shell dumpsys window windows > .maestro/debug/window-state.txt
+
+            if [ "$SUCCESS_EXIT" -ne 0 ] || [ "$CANCEL_EXIT" -ne 0 ]; then
+              echo "Wallet reconnect E2E failed: success=$SUCCESS_EXIT cancel=$CANCEL_EXIT"
+              exit 1
+            fi
+
+      - name: Upload wallet reconnect E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-wallet-reconnect-e2e-artifacts
+          path: app/mobile/.maestro/debug/
+          if-no-files-found: warn
